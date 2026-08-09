@@ -223,6 +223,16 @@ server.on('upgrade', (req, socket, head) => {
   }
 });
 
+app.delete("/api/users/account", auth, async (req, res) => {
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ error: "Contraseña requerida" });
+  const { rows } = await pool.query("SELECT password_hash FROM users WHERE id=$1", [req.userId]);
+  if (!rows.length) return res.status(404).json({ error: "Usuario no encontrado" });
+  const valid = await bcrypt.compare(password, rows[0].password_hash);
+  if (!valid) return res.status(401).json({ error: "Contraseña incorrecta" });
+  await pool.query("DELETE FROM users WHERE id=$1", [req.userId]);
+  res.json({ message: "Cuenta eliminada" });
+});
 server.listen(PORT, () => console.log(`Seend server en puerto ${PORT}`));
 
 // Keep-alive cada 5 minutos para evitar cold start
