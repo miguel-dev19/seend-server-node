@@ -239,8 +239,11 @@ server.listen(PORT, () => console.log(`Seend server en puerto ${PORT}`));
 setInterval(() => {
   try { require("https").get("https://seend-server.onrender.com/api/health", () => {}); } catch(e) {}
 }, 300000);
-
-// Keep-alive cada 5 minutos para evitar cold start
-setInterval(() => {
-  try { require("https").get("https://seend-server.onrender.com/api/health", () => {}); } catch(e) {}
-}, 300000);
+// Mensajes pendientes del chat
+app.get('/api/chats/:id/messages', auth, async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT id, chat_id, sender_id, content, status, created_at FROM pending_messages WHERE chat_id=$1 AND receiver_id=$2 ORDER BY created_at DESC LIMIT 50',
+    [req.params.id, req.userId]
+  );
+  res.json(rows);
+});
