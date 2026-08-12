@@ -29,21 +29,6 @@ pool.query(`
     is_online BOOLEAN DEFAULT FALSE,
     is_typing BOOLEAN DEFAULT FALSE
   );
-  CREATE TABLE IF NOT EXISTS chats (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user1_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    user2_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    UNIQUE(user1_id, user2_id)
-  );
-  CREATE TABLE IF NOT EXISTS pending_messages (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    chat_id TEXT NOT NULL,
-    sender_id UUID NOT NULL,
-    receiver_id UUID,
-    content TEXT NOT NULL,
-    status VARCHAR(20) DEFAULT 'pending',
-    created_at TIMESTAMP DEFAULT NOW()
-  );
   CREATE TABLE IF NOT EXISTS global_messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     sender_id UUID NOT NULL,
@@ -82,7 +67,6 @@ wss.on('connection', (ws, req) => {
   pool.query('UPDATE users SET is_online=true, last_seen=NOW() WHERE id=$1', [userId]);
   broadcastStatus(userId, true);
   sendGlobalHistory(userId);
-  sendDirectPending(userId);
 
   ws.on('message', (data) => {
     try {
@@ -103,47 +87,23 @@ async function handleMessage(senderId, msg) {
   const { type, data } = msg;
   const chatId = data?.chat_id;
   const content = data?.content;
-  const receiverId = data?.receiver_id;
   const msgId = uuidv4();
   const now = new Date().toISOString();
 
-  if (type === 'message') {
-    // CHAT GLOBAL
-    if (chatId === 'global') {
-      // Guardar en historial global
-      await pool.query('INSERT INTO global_messages (id, sender_id, content) VALUES ($1, $2, $3)', [msgId, senderId, content]);
-      
-      const resp = { type: 'message', message: { id: msgId, chat_id: 'global', sender_id: senderId, content, status: 'delivered', created_at: now } };
-      
-      // Broadcast a todos los conectados
-      clients.forEach((ws) => {
-        try { ws.send(JSON.stringify(resp)); } catch (e) {}
-      });
-      return;
-    }
-
-    // CHAT INDIVIDUAL
-    const resp = { type: 'message', message: { id: msgId, chat_id: chatId, sender_id: senderId, content, status: 'sent', created_at: now } };
+  if (type === 'message' && chatId === 'global') {
+    await pool.query('INSERT INTO global_messages (id, sender_id, content) VALUES ($1, $2, $3)', [msgId, senderId, content]);
     
-    if (receiverId && clients.has(receiverId)) {
-      clients.get(receiverId).send(JSON.stringify(resp));
-      const delivered = { type: 'message', message: { id: msgId, chat_id: chatId, sender_id: senderId, content, status: 'delivered', created_at: now } };
-      if (clients.has(senderId)) clients.get(senderId).send(JSON.stringify(delivered));
-    } else if (receiverId) {
-      await pool.query('INSERT INTO pending_messages (id, chat_id, sender_id, receiver_id, content) VALUES ($1,$2,$3,$4,$5)', [msgId, chatId, senderId, receiverId, content]);
-    }
-    if (clients.has(senderId)) clients.get(senderId).send(JSON.stringify(resp));
+    const userResult = await pool.query('SELECT username, profile_pic FROM users WHERE id=$1', [senderId]);
+    const user = userResult.rows[0] || { username: 'Usuario', profile_pic: '' };
+    
+    const resp = { type: 'message', message: { id: msgId, chat_id: 'global', sender_id: senderId, content, status: 'delivered', created_at: now, sender_name: user.username, sender_avatar: user.profile_pic } };
+    
+    clients.forEach((ws) => {
+      try { ws.send(JSON.stringify(resp)); } catch (e) {}
+    });
   }
   else if (type === 'typing') {
-    const isTyping = data?.is_typing;
-    broadcastTyping(senderId, isTyping);
-  }
-  else if (type === 'read') {
-    const messageId = data?.message_id;
-    await pool.query('DELETE FROM pending_messages WHERE id=$1', [messageId]);
-    if (clients.has(senderId)) {
-      clients.get(senderId).send(JSON.stringify({ type: 'read_receipt', chat_id: chatId, message_id: messageId, read_by: senderId }));
-    }
+    broadcastTyping(senderId, data?.is_typing);
   }
 }
 
@@ -156,15 +116,19 @@ function broadcastTyping(userId, isTyping) {
   });
 }
 
-// Enviar historial global al conectar
-async function sendGlobalHistory(userId) {
+// Paginación: envía 20 mensajes, luego 20 más cuando la app lo pida
+async function sendGlobalHistory(userId, offset = 0) {
   if (!clients.has(userId)) return;
+  const limit = 20;
   const { rows } = await pool.query(
     `SELECT gm.id, gm.sender_id, gm.content, gm.created_at, u.username, u.profile_pic
      FROM global_messages gm JOIN users u ON gm.sender_id = u.id
-     ORDER BY gm.created_at ASC LIMIT 50`
+     ORDER BY gm.created_at DESC LIMIT $1 OFFSET $2`,
+    [limit, offset]
   );
-  for (const row of rows) {
+  
+  // Enviar del más antiguo al más reciente
+  rows.reverse().forEach((row) => {
     clients.get(userId).send(JSON.stringify({
       type: 'message',
       message: {
@@ -173,17 +137,21 @@ async function sendGlobalHistory(userId) {
         sender_name: row.username, sender_avatar: row.profile_pic
       }
     }));
-  }
+  });
 }
 
-async function sendDirectPending(userId) {
-  if (!clients.has(userId)) return;
-  const { rows } = await pool.query('SELECT id, chat_id, sender_id, content, created_at FROM pending_messages WHERE receiver_id=$1 ORDER BY created_at', [userId]);
-  for (const row of rows) {
-    clients.get(userId).send(JSON.stringify({ type: 'message', message: { id: row.id, chat_id: row.chat_id, sender_id: row.sender_id, content: row.content, status: 'delivered', created_at: row.created_at } }));
-    await pool.query('DELETE FROM pending_messages WHERE id=$1', [row.id]);
-  }
-}
+// Endpoint para cargar más mensajes
+app.get('/api/global/messages', auth, async (req, res) => {
+  const offset = parseInt(req.query.offset) || 0;
+  const limit = 20;
+  const { rows } = await pool.query(
+    `SELECT gm.id, gm.sender_id, gm.content, gm.created_at, u.username, u.profile_pic
+     FROM global_messages gm JOIN users u ON gm.sender_id = u.id
+     ORDER BY gm.created_at DESC LIMIT $1 OFFSET $2`,
+    [limit, offset]
+  );
+  res.json(rows.reverse());
+});
 
 function broadcastStatus(userId, online) {
   const msg = JSON.stringify({ type: 'user_status', user_id: userId, online, last_seen: new Date().toISOString() });
@@ -218,7 +186,6 @@ app.get('/api/auth/check-username/:username', async (req, res) => {
   res.json({ username: req.params.username, available: !rows.length, message: rows.length ? 'No disponible' : 'Disponible' });
 });
 
-// Users
 app.get('/api/users', auth, async (req, res) => {
   const { rows } = await pool.query('SELECT id, username, profile_pic, info, last_seen, is_online FROM users WHERE id!=$1 ORDER BY is_online DESC LIMIT 100', [req.userId]);
   res.json(rows);
@@ -228,16 +195,6 @@ app.get('/api/users/:id', auth, async (req, res) => {
   const { rows } = await pool.query('SELECT id, username, profile_pic, info, last_seen, is_online FROM users WHERE id=$1', [req.params.id]);
   if (!rows.length) return res.status(404).json({ error: 'No encontrado' });
   res.json(rows[0]);
-});
-
-// Chats individuales (se mantienen por compatibilidad)
-app.get('/api/chats', auth, async (req, res) => {
-  res.json([]);
-});
-
-app.post('/api/chats/user/:id', auth, async (req, res) => {
-  const id = uuidv4();
-  res.json({ chat_id: id });
 });
 
 app.delete('/api/users/account', auth, async (req, res) => {
