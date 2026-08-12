@@ -18,7 +18,6 @@ const PORT = process.env.PORT || 8080;
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
-// Crear tablas
 pool.query(`
   CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -38,16 +37,15 @@ pool.query(`
   );
   CREATE TABLE IF NOT EXISTS pending_messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    chat_id UUID REFERENCES chats(id) ON DELETE CASCADE,
+    chat_id TEXT NOT NULL,
     sender_id UUID NOT NULL,
-    receiver_id UUID NOT NULL,
+    receiver_id UUID,
     content TEXT NOT NULL,
     status VARCHAR(20) DEFAULT 'pending',
     created_at TIMESTAMP DEFAULT NOW()
   );
 `);
 
-// Middleware JWT
 function auth(req, res, next) {
   const header = req.headers.authorization;
   if (!header) return res.status(401).json({ error: 'Token requerido' });
@@ -62,8 +60,8 @@ function auth(req, res, next) {
   }
 }
 
-// WebSocket
 const clients = new Map();
+const typingUsers = new Map();
 
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://localhost');
@@ -81,14 +79,18 @@ wss.on('connection', (ws, req) => {
   sendPending(userId);
 
   ws.on('message', (data) => {
-    const msg = JSON.parse(data);
-    handleMessage(userId, msg);
+    try {
+      const msg = JSON.parse(data);
+      handleMessage(userId, msg);
+    } catch (e) { console.error('Error parsing message:', e); }
   });
 
   ws.on('close', () => {
     clients.delete(userId);
+    typingUsers.delete(userId);
     pool.query('UPDATE users SET is_online=false, is_typing=false, last_seen=NOW() WHERE id=$1', [userId]);
     broadcastStatus(userId, false);
+    broadcastTyping(userId, false);
   });
 });
 
@@ -101,24 +103,35 @@ async function handleMessage(senderId, msg) {
   const now = new Date().toISOString();
 
   if (type === 'message') {
+    // CHAT GLOBAL: broadcast a todos
+    if (chatId === 'global') {
+      const resp = { type: 'message', message: { id: msgId, chat_id: 'global', sender_id: senderId, content, status: 'delivered', created_at: now } };
+      clients.forEach((ws, id) => {
+        try { ws.send(JSON.stringify(resp)); } catch (e) {}
+      });
+      return;
+    }
+
+    // Chat individual
     const resp = { type: 'message', message: { id: msgId, chat_id: chatId, sender_id: senderId, content, status: 'sent', created_at: now } };
     
-    if (clients.has(receiverId)) {
+    if (receiverId && clients.has(receiverId)) {
       clients.get(receiverId).send(JSON.stringify(resp));
       const delivered = { type: 'message', message: { id: msgId, chat_id: chatId, sender_id: senderId, content, status: 'delivered', created_at: now } };
       if (clients.has(senderId)) clients.get(senderId).send(JSON.stringify(delivered));
-    } else {
+    } else if (receiverId) {
       await pool.query('INSERT INTO pending_messages (id, chat_id, sender_id, receiver_id, content) VALUES ($1,$2,$3,$4,$5)', [msgId, chatId, senderId, receiverId, content]);
     }
     if (clients.has(senderId)) clients.get(senderId).send(JSON.stringify(resp));
   }
   else if (type === 'typing') {
     const isTyping = data?.is_typing;
-    const { rows } = await pool.query('SELECT CASE WHEN user1_id=$1 THEN user2_id ELSE user1_id END AS other FROM chats WHERE id=$2', [senderId, chatId]);
-    const otherId = rows[0]?.other;
-    if (otherId && clients.has(otherId)) {
-      clients.get(otherId).send(JSON.stringify({ type: 'typing', chat_id: chatId, user_id: senderId, typing: isTyping }));
+    if (isTyping) {
+      typingUsers.set(senderId, true);
+    } else {
+      typingUsers.delete(senderId);
     }
+    broadcastTyping(senderId, isTyping);
   }
   else if (type === 'read') {
     const messageId = data?.message_id;
@@ -127,6 +140,15 @@ async function handleMessage(senderId, msg) {
       clients.get(senderId).send(JSON.stringify({ type: 'read_receipt', chat_id: chatId, message_id: messageId, read_by: senderId }));
     }
   }
+}
+
+function broadcastTyping(userId, isTyping) {
+  const msg = JSON.stringify({ type: 'typing', chat_id: 'global', user_id: userId, typing: isTyping });
+  clients.forEach((ws, id) => {
+    if (id !== userId) {
+      try { ws.send(msg); } catch (e) {}
+    }
+  });
 }
 
 async function sendPending(userId) {
@@ -140,7 +162,7 @@ async function sendPending(userId) {
 
 function broadcastStatus(userId, online) {
   const msg = JSON.stringify({ type: 'user_status', user_id: userId, online, last_seen: new Date().toISOString() });
-  clients.forEach((ws, id) => { if (id !== userId) ws.send(msg); });
+  clients.forEach((ws, id) => { if (id !== userId) { try { ws.send(msg); } catch (e) {} } });
 }
 
 // Auth
@@ -212,9 +234,27 @@ app.post('/api/chats/user/:id', auth, async (req, res) => {
   res.json({ chat_id: id });
 });
 
+app.get('/api/chats/:id/messages', auth, async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT id, chat_id, sender_id, content, status, created_at FROM pending_messages WHERE chat_id=$1 AND receiver_id=$2 ORDER BY created_at DESC LIMIT 50',
+    [req.params.id, req.userId]
+  );
+  res.json(rows);
+});
+
+app.delete('/api/users/account', auth, async (req, res) => {
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ error: 'Contraseña requerida' });
+  const { rows } = await pool.query('SELECT password_hash FROM users WHERE id=$1', [req.userId]);
+  if (!rows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+  const valid = await bcrypt.compare(password, rows[0].password_hash);
+  if (!valid) return res.status(401).json({ error: 'Contraseña incorrecta' });
+  await pool.query('DELETE FROM users WHERE id=$1', [req.userId]);
+  res.json({ message: 'Cuenta eliminada' });
+});
+
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
-// WebSocket upgrade
 server.on('upgrade', (req, socket, head) => {
   if (req.url.startsWith('/api/ws')) {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
@@ -223,27 +263,8 @@ server.on('upgrade', (req, socket, head) => {
   }
 });
 
-app.delete("/api/users/account", auth, async (req, res) => {
-  const { password } = req.body;
-  if (!password) return res.status(400).json({ error: "Contraseña requerida" });
-  const { rows } = await pool.query("SELECT password_hash FROM users WHERE id=$1", [req.userId]);
-  if (!rows.length) return res.status(404).json({ error: "Usuario no encontrado" });
-  const valid = await bcrypt.compare(password, rows[0].password_hash);
-  if (!valid) return res.status(401).json({ error: "Contraseña incorrecta" });
-  await pool.query("DELETE FROM users WHERE id=$1", [req.userId]);
-  res.json({ message: "Cuenta eliminada" });
-});
 server.listen(PORT, () => console.log(`Seend server en puerto ${PORT}`));
 
-// Keep-alive cada 5 minutos para evitar cold start
 setInterval(() => {
-  try { require("https").get("https://seend-server.onrender.com/api/health", () => {}); } catch(e) {}
+  try { require('https').get('https://seend-server.onrender.com/api/health', () => {}); } catch(e) {}
 }, 300000);
-// Mensajes pendientes del chat
-app.get('/api/chats/:id/messages', auth, async (req, res) => {
-  const { rows } = await pool.query(
-    'SELECT id, chat_id, sender_id, content, status, created_at FROM pending_messages WHERE chat_id=$1 AND receiver_id=$2 ORDER BY created_at DESC LIMIT 50',
-    [req.params.id, req.userId]
-  );
-  res.json(rows);
-});
