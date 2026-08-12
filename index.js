@@ -44,6 +44,12 @@ pool.query(`
     status VARCHAR(20) DEFAULT 'pending',
     created_at TIMESTAMP DEFAULT NOW()
   );
+  CREATE TABLE IF NOT EXISTS global_messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    sender_id UUID NOT NULL,
+    content TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+  );
 `);
 
 function auth(req, res, next) {
@@ -61,7 +67,6 @@ function auth(req, res, next) {
 }
 
 const clients = new Map();
-const typingUsers = new Map();
 
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://localhost');
@@ -76,18 +81,18 @@ wss.on('connection', (ws, req) => {
   clients.set(userId, ws);
   pool.query('UPDATE users SET is_online=true, last_seen=NOW() WHERE id=$1', [userId]);
   broadcastStatus(userId, true);
-  sendPending(userId);
+  sendGlobalHistory(userId);
+  sendDirectPending(userId);
 
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data);
       handleMessage(userId, msg);
-    } catch (e) { console.error('Error parsing message:', e); }
+    } catch (e) { console.error('Error parsing:', e); }
   });
 
   ws.on('close', () => {
     clients.delete(userId);
-    typingUsers.delete(userId);
     pool.query('UPDATE users SET is_online=false, is_typing=false, last_seen=NOW() WHERE id=$1', [userId]);
     broadcastStatus(userId, false);
     broadcastTyping(userId, false);
@@ -103,16 +108,21 @@ async function handleMessage(senderId, msg) {
   const now = new Date().toISOString();
 
   if (type === 'message') {
-    // CHAT GLOBAL: broadcast a todos
+    // CHAT GLOBAL
     if (chatId === 'global') {
+      // Guardar en historial global
+      await pool.query('INSERT INTO global_messages (id, sender_id, content) VALUES ($1, $2, $3)', [msgId, senderId, content]);
+      
       const resp = { type: 'message', message: { id: msgId, chat_id: 'global', sender_id: senderId, content, status: 'delivered', created_at: now } };
-      clients.forEach((ws, id) => {
+      
+      // Broadcast a todos los conectados
+      clients.forEach((ws) => {
         try { ws.send(JSON.stringify(resp)); } catch (e) {}
       });
       return;
     }
 
-    // Chat individual
+    // CHAT INDIVIDUAL
     const resp = { type: 'message', message: { id: msgId, chat_id: chatId, sender_id: senderId, content, status: 'sent', created_at: now } };
     
     if (receiverId && clients.has(receiverId)) {
@@ -126,11 +136,6 @@ async function handleMessage(senderId, msg) {
   }
   else if (type === 'typing') {
     const isTyping = data?.is_typing;
-    if (isTyping) {
-      typingUsers.set(senderId, true);
-    } else {
-      typingUsers.delete(senderId);
-    }
     broadcastTyping(senderId, isTyping);
   }
   else if (type === 'read') {
@@ -151,7 +156,27 @@ function broadcastTyping(userId, isTyping) {
   });
 }
 
-async function sendPending(userId) {
+// Enviar historial global al conectar
+async function sendGlobalHistory(userId) {
+  if (!clients.has(userId)) return;
+  const { rows } = await pool.query(
+    `SELECT gm.id, gm.sender_id, gm.content, gm.created_at, u.username, u.profile_pic
+     FROM global_messages gm JOIN users u ON gm.sender_id = u.id
+     ORDER BY gm.created_at ASC LIMIT 50`
+  );
+  for (const row of rows) {
+    clients.get(userId).send(JSON.stringify({
+      type: 'message',
+      message: {
+        id: row.id, chat_id: 'global', sender_id: row.sender_id,
+        content: row.content, status: 'delivered', created_at: row.created_at,
+        sender_name: row.username, sender_avatar: row.profile_pic
+      }
+    }));
+  }
+}
+
+async function sendDirectPending(userId) {
   if (!clients.has(userId)) return;
   const { rows } = await pool.query('SELECT id, chat_id, sender_id, content, created_at FROM pending_messages WHERE receiver_id=$1 ORDER BY created_at', [userId]);
   for (const row of rows) {
@@ -205,41 +230,14 @@ app.get('/api/users/:id', auth, async (req, res) => {
   res.json(rows[0]);
 });
 
-// Chats
+// Chats individuales (se mantienen por compatibilidad)
 app.get('/api/chats', auth, async (req, res) => {
-  const { rows } = await pool.query(`
-    SELECT c.id, 
-      CASE WHEN c.user1_id=$1 THEN u2.username ELSE u1.username END as username,
-      CASE WHEN c.user1_id=$1 THEN u2.profile_pic ELSE u1.profile_pic END as profile_pic,
-      CASE WHEN c.user1_id=$1 THEN u2.id ELSE u1.id END as other_id,
-      CASE WHEN c.user1_id=$1 THEN u2.is_online ELSE u1.is_online END as is_online,
-      CASE WHEN c.user1_id=$1 THEN u2.info ELSE u1.info END as info,
-      COALESCE((SELECT content FROM pending_messages WHERE chat_id=c.id ORDER BY created_at DESC LIMIT 1), '') as last_message,
-      COALESCE((SELECT created_at FROM pending_messages WHERE chat_id=c.id ORDER BY created_at DESC LIMIT 1)::text, '') as last_time,
-      COALESCE((SELECT status FROM pending_messages WHERE chat_id=c.id AND receiver_id=$1 ORDER BY created_at DESC LIMIT 1), '') as last_msg_status,
-      (SELECT COUNT(*) FROM pending_messages WHERE chat_id=c.id AND receiver_id=$1) as unread_count
-    FROM chats c
-    JOIN users u1 ON c.user1_id=u1.id JOIN users u2 ON c.user2_id=u2.id
-    WHERE c.user1_id=$1 OR c.user2_id=$1 ORDER BY last_time DESC NULLS LAST
-  `, [req.userId]);
-  res.json(rows.map(r => ({ id: r.id, other_user: { id: r.other_id, username: r.username, profile_pic: r.profile_pic, info: r.info, is_online: r.is_online }, last_message: r.last_message, last_time: r.last_time, unread_count: parseInt(r.unread_count) || 0, last_msg_status: r.last_msg_status })));
+  res.json([]);
 });
 
 app.post('/api/chats/user/:id', auth, async (req, res) => {
-  if (req.userId === req.params.id) return res.status(400).json({ error: 'No puedes chatear contigo mismo' });
-  const { rows } = await pool.query("SELECT id FROM chats WHERE (user1_id=$1 AND user2_id=$2) OR (user1_id=$2 AND user2_id=$1)", [req.userId, req.params.id]);
-  if (rows.length) return res.json({ chat_id: rows[0].id });
   const id = uuidv4();
-  await pool.query('INSERT INTO chats (id, user1_id, user2_id) VALUES ($1,$2,$3)', [id, req.userId, req.params.id]);
   res.json({ chat_id: id });
-});
-
-app.get('/api/chats/:id/messages', auth, async (req, res) => {
-  const { rows } = await pool.query(
-    'SELECT id, chat_id, sender_id, content, status, created_at FROM pending_messages WHERE chat_id=$1 AND receiver_id=$2 ORDER BY created_at DESC LIMIT 50',
-    [req.params.id, req.userId]
-  );
-  res.json(rows);
 });
 
 app.delete('/api/users/account', auth, async (req, res) => {
